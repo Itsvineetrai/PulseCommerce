@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulsecommerce"
+version = "0.1.0"
+description = "Product Analytics and Experimentation Platform"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb",
+    "pyarrow",
+    "pandas",
+    "numpy",
+    "prefect>=3",
+    "scipy",
+    "scikit-learn",
+    "streamlit",
+    "plotly",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
