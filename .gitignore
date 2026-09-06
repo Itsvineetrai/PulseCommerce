@@ -10,3 +10,5 @@ data/artifacts/*
 !data/landing/.gitkeep
 !data/warehouse/.gitkeep
 !data/artifacts/.gitkeep
+data/warehouse/*.duckdb
+data/landing/events/*.parquet
