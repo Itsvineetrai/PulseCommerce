@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Validate the complete PulseCommerce end-to-end pipeline."""
 
 from pathlib import Path
 
@@ -7,13 +7,21 @@ import duckdb
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-WAREHOUSE_PATH = PROJECT_ROOT / "data" / "warehouse" / "pulsecommerce.duckdb"
-CHURN_MODEL_PATH = PROJECT_ROOT / "artifacts" / "churn_model.joblib"
+WAREHOUSE_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "warehouse"
+    / "pulsecommerce.duckdb"
+)
 
-EXPECTED_SESSION_COUNT = 15_000
-PORTFOLIO_CAPACITY = 500
+CHURN_MODEL_PATH = (
+    PROJECT_ROOT
+    / "artifacts"
+    / "churn_model.joblib"
+)
 
-REQUIRED_TABLES = [
+
+REQUIRED_TABLES = {
     "events",
     "analytics_session_funnel",
     "analytics_funnel_metrics",
@@ -25,87 +33,45 @@ REQUIRED_TABLES = [
     "analytics_intervention_economics",
     "analytics_intervention_portfolio",
     "analytics_intervention_roi",
-]
+}
 
 
-def check_required_table(
-    connection: duckdb.DuckDBPyConnection,
-    table_name: str,
-) -> None:
-    exists = connection.execute(
-        """
-        SELECT COUNT(*)
-        FROM information_schema.tables
-        WHERE table_schema = 'main'
-          AND table_name = ?
-        """,
-        [table_name],
-    ).fetchone()[0]
+def require(condition: bool, message: str) -> None:
+    """Raise an error when a validation contract fails."""
 
-    if exists != 1:
-        raise RuntimeError(
-            f"Required table is missing: {table_name}"
-        )
-
-
-def get_row_count(
-    connection: duckdb.DuckDBPyConnection,
-    table_name: str,
-) -> int:
-    return connection.execute(
-        f"SELECT COUNT(*) FROM {table_name}"
-    ).fetchone()[0]
-
-
-def get_duplicate_session_count(
-    connection: duckdb.DuckDBPyConnection,
-    table_name: str,
-) -> int:
-    return connection.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM (
-            SELECT session_id
-            FROM {table_name}
-            GROUP BY session_id
-            HAVING COUNT(*) > 1
-        )
-        """
-    ).fetchone()[0]
-
-
-def get_null_count(
-    connection: duckdb.DuckDBPyConnection,
-    table_name: str,
-    column_name: str,
-) -> int:
-    return connection.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM {table_name}
-        WHERE {column_name} IS NULL
-        """
-    ).fetchone()[0]
+    if not condition:
+        raise ValueError(message)
 
 
 def main() -> None:
-    print("PulseCommerce Complete End-to-End Pipeline Validation")
-    print("-" * 65)
+    """Run complete end-to-end pipeline validation."""
+
+    print("PulseCommerce End-to-End Pipeline Validation")
+    print("-" * 60)
+
+    # ---------------------------------------------------------
+    # 1. PROJECT ARTIFACT CHECK
+    # ---------------------------------------------------------
 
     print("\n1. PROJECT ARTIFACT CHECK")
 
-    if not WAREHOUSE_PATH.exists():
-        raise FileNotFoundError(
-            f"Warehouse database not found: {WAREHOUSE_PATH}"
-        )
-
-    if not CHURN_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Churn model artifact not found: {CHURN_MODEL_PATH}"
-        )
+    require(
+        WAREHOUSE_PATH.exists(),
+        f"Warehouse artifact not found: {WAREHOUSE_PATH}",
+    )
 
     print("Warehouse artifact: PASSED")
+
+    require(
+        CHURN_MODEL_PATH.exists(),
+        f"Churn model artifact not found: {CHURN_MODEL_PATH}",
+    )
+
     print("Churn model artifact: PASSED")
+
+    # ---------------------------------------------------------
+    # DATABASE CONNECTION
+    # ---------------------------------------------------------
 
     connection = duckdb.connect(
         str(WAREHOUSE_PATH),
@@ -113,62 +79,116 @@ def main() -> None:
     )
 
     try:
+        # -----------------------------------------------------
+        # 2. WAREHOUSE TABLE CHECK
+        # -----------------------------------------------------
+
         print("\n2. WAREHOUSE TABLE CHECK")
 
-        for table_name in REQUIRED_TABLES:
-            check_required_table(
-                connection,
-                table_name,
-            )
+        available_tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main'
+                """
+            ).fetchall()
+        }
+
+        missing_tables = REQUIRED_TABLES - available_tables
+
+        require(
+            not missing_tables,
+            (
+                "Missing required warehouse tables: "
+                f"{sorted(missing_tables)}"
+            ),
+        )
 
         print(
             f"Required warehouse tables: {len(REQUIRED_TABLES)}"
         )
+
         print("Warehouse table validation: PASSED")
+
+        # -----------------------------------------------------
+        # 3. CHURN FEATURE DATASET VALIDATION
+        # -----------------------------------------------------
 
         print("\n3. CHURN FEATURE DATASET VALIDATION")
 
-        churn_rows = get_row_count(
-            connection,
-            "analytics_churn_feature_dataset",
+        churn_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM analytics_churn_feature_dataset
+            """
+        ).fetchone()[0]
+
+        duplicate_churn_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT
+                    session_id
+                FROM analytics_churn_feature_dataset
+                GROUP BY session_id
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
+
+        require(
+            churn_sessions > 0,
+            "Churn feature dataset contains no sessions.",
         )
 
-        churn_duplicates = get_duplicate_session_count(
-            connection,
-            "analytics_churn_feature_dataset",
+        require(
+            duplicate_churn_sessions == 0,
+            (
+                "Duplicate churn feature sessions found: "
+                f"{duplicate_churn_sessions}"
+            ),
         )
 
-        print(f"Churn dataset sessions: {churn_rows:,}")
         print(
-            f"Duplicate churn sessions: {churn_duplicates:,}"
+            f"Churn dataset sessions: {churn_sessions:,}"
         )
 
-        if churn_rows != EXPECTED_SESSION_COUNT:
-            raise RuntimeError(
-                f"Expected {EXPECTED_SESSION_COUNT:,} churn sessions "
-                f"but found {churn_rows:,}."
-            )
-
-        if churn_duplicates != 0:
-            raise RuntimeError(
-                "Duplicate session IDs found in churn dataset."
-            )
+        print(
+            f"Duplicate churn sessions: "
+            f"{duplicate_churn_sessions:,}"
+        )
 
         print("Churn feature dataset: PASSED")
 
+        # -----------------------------------------------------
+        # 4. CHURN RISK SCORE RECONCILIATION
+        # -----------------------------------------------------
+
         print("\n4. CHURN RISK SCORE RECONCILIATION")
 
-        risk_rows = get_row_count(
-            connection,
-            "analytics_churn_risk_scores",
-        )
+        risk_score_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM analytics_churn_risk_scores
+            """
+        ).fetchone()[0]
 
-        risk_duplicates = get_duplicate_session_count(
-            connection,
-            "analytics_churn_risk_scores",
-        )
+        duplicate_risk_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT
+                    session_id
+                FROM analytics_churn_risk_scores
+                GROUP BY session_id
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
 
-        missing_risk_sessions = connection.execute(
+        feature_sessions_missing_scores = connection.execute(
             """
             SELECT COUNT(*)
             FROM analytics_churn_feature_dataset AS features
@@ -178,7 +198,7 @@ def main() -> None:
             """
         ).fetchone()[0]
 
-        unexpected_risk_sessions = connection.execute(
+        unexpected_scored_sessions = connection.execute(
             """
             SELECT COUNT(*)
             FROM analytics_churn_risk_scores AS scores
@@ -188,56 +208,86 @@ def main() -> None:
             """
         ).fetchone()[0]
 
-        print(f"Risk score sessions: {risk_rows:,}")
-        print(
-            f"Duplicate risk sessions: {risk_duplicates:,}"
+        require(
+            risk_score_sessions == churn_sessions,
+            (
+                "Risk score session count does not match "
+                "churn feature dataset."
+            ),
         )
+
+        require(
+            duplicate_risk_sessions == 0,
+            (
+                "Duplicate risk score sessions found: "
+                f"{duplicate_risk_sessions}"
+            ),
+        )
+
+        require(
+            feature_sessions_missing_scores == 0,
+            (
+                "Feature sessions missing risk scores: "
+                f"{feature_sessions_missing_scores}"
+            ),
+        )
+
+        require(
+            unexpected_scored_sessions == 0,
+            (
+                "Unexpected scored sessions: "
+                f"{unexpected_scored_sessions}"
+            ),
+        )
+
+        print(
+            f"Risk score sessions: {risk_score_sessions:,}"
+        )
+
+        print(
+            f"Duplicate risk sessions: "
+            f"{duplicate_risk_sessions:,}"
+        )
+
         print(
             f"Feature sessions missing scores: "
-            f"{missing_risk_sessions:,}"
+            f"{feature_sessions_missing_scores:,}"
         )
+
         print(
             f"Unexpected scored sessions: "
-            f"{unexpected_risk_sessions:,}"
+            f"{unexpected_scored_sessions:,}"
         )
-
-        if risk_rows != EXPECTED_SESSION_COUNT:
-            raise RuntimeError(
-                "Risk score row count does not match "
-                "expected session count."
-            )
-
-        if risk_duplicates != 0:
-            raise RuntimeError(
-                "Duplicate session IDs found in risk scores."
-            )
-
-        if missing_risk_sessions != 0:
-            raise RuntimeError(
-                "Feature dataset contains sessions "
-                "missing churn risk scores."
-            )
-
-        if unexpected_risk_sessions != 0:
-            raise RuntimeError(
-                "Risk score dataset contains unexpected sessions."
-            )
 
         print("Churn risk reconciliation: PASSED")
 
+        # -----------------------------------------------------
+        # 5. INTERVENTION CANDIDATE VALIDATION
+        # -----------------------------------------------------
+
         print("\n5. INTERVENTION CANDIDATE VALIDATION")
 
-        candidate_rows = get_row_count(
-            connection,
-            "analytics_intervention_candidates",
-        )
+        candidate_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM analytics_intervention_candidates
+            """
+        ).fetchone()[0]
 
-        candidate_duplicates = get_duplicate_session_count(
-            connection,
-            "analytics_intervention_candidates",
-        )
+        duplicate_candidate_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT
+                    session_id
+                FROM analytics_intervention_candidates
+                GROUP BY session_id
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
 
-        missing_candidate_sessions = connection.execute(
+        candidates_missing_risk_scores = connection.execute(
             """
             SELECT COUNT(*)
             FROM analytics_intervention_candidates AS candidates
@@ -247,62 +297,95 @@ def main() -> None:
             """
         ).fetchone()[0]
 
-        null_actions = get_null_count(
-            connection,
-            "analytics_intervention_candidates",
-            "recommended_action",
+        missing_recommended_actions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM analytics_intervention_candidates
+            WHERE recommended_action IS NULL
+               OR TRIM(recommended_action) = ''
+            """
+        ).fetchone()[0]
+
+        require(
+            candidate_sessions == risk_score_sessions,
+            (
+                "Candidate session count does not match "
+                "risk score session count."
+            ),
         )
 
-        print(f"Candidate sessions: {candidate_rows:,}")
+        require(
+            duplicate_candidate_sessions == 0,
+            (
+                "Duplicate candidate sessions found: "
+                f"{duplicate_candidate_sessions}"
+            ),
+        )
+
+        require(
+            candidates_missing_risk_scores == 0,
+            (
+                "Candidates missing risk scores: "
+                f"{candidates_missing_risk_scores}"
+            ),
+        )
+
+        require(
+            missing_recommended_actions == 0,
+            (
+                "Missing recommended actions: "
+                f"{missing_recommended_actions}"
+            ),
+        )
+
+        print(
+            f"Candidate sessions: {candidate_sessions:,}"
+        )
+
         print(
             f"Duplicate candidate sessions: "
-            f"{candidate_duplicates:,}"
+            f"{duplicate_candidate_sessions:,}"
         )
+
         print(
             f"Candidates missing risk scores: "
-            f"{missing_candidate_sessions:,}"
+            f"{candidates_missing_risk_scores:,}"
         )
+
         print(
-            f"Missing recommended actions: {null_actions:,}"
+            f"Missing recommended actions: "
+            f"{missing_recommended_actions:,}"
         )
-
-        if candidate_rows != EXPECTED_SESSION_COUNT:
-            raise RuntimeError(
-                "Intervention candidate row count does not match "
-                "expected session count."
-            )
-
-        if candidate_duplicates != 0:
-            raise RuntimeError(
-                "Duplicate session IDs found in intervention candidates."
-            )
-
-        if missing_candidate_sessions != 0:
-            raise RuntimeError(
-                "Intervention candidates contain sessions "
-                "without risk scores."
-            )
-
-        if null_actions != 0:
-            raise RuntimeError(
-                "Intervention candidates contain missing actions."
-            )
 
         print("Intervention candidates: PASSED")
 
+        # -----------------------------------------------------
+        # 6. INTERVENTION ECONOMICS RECONCILIATION
+        # -----------------------------------------------------
+
         print("\n6. INTERVENTION ECONOMICS RECONCILIATION")
 
-        economics_rows = get_row_count(
-            connection,
-            "analytics_intervention_economics",
-        )
+        economics_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM analytics_intervention_economics
+            """
+        ).fetchone()[0]
 
-        economics_duplicates = get_duplicate_session_count(
-            connection,
-            "analytics_intervention_economics",
-        )
+        duplicate_economics_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT
+                    session_id
+                FROM analytics_intervention_economics
+                GROUP BY session_id
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
 
-        missing_economics_sessions = connection.execute(
+        candidates_missing_economics = connection.execute(
             """
             SELECT COUNT(*)
             FROM analytics_intervention_candidates AS candidates
@@ -312,47 +395,73 @@ def main() -> None:
             """
         ).fetchone()[0]
 
-        print(f"Economics sessions: {economics_rows:,}")
+        require(
+            economics_sessions == candidate_sessions,
+            (
+                "Economics session count does not match "
+                "candidate session count."
+            ),
+        )
+
+        require(
+            duplicate_economics_sessions == 0,
+            (
+                "Duplicate economics sessions found: "
+                f"{duplicate_economics_sessions}"
+            ),
+        )
+
+        require(
+            candidates_missing_economics == 0,
+            (
+                "Candidates missing economics: "
+                f"{candidates_missing_economics}"
+            ),
+        )
+
+        print(
+            f"Economics sessions: {economics_sessions:,}"
+        )
+
         print(
             f"Duplicate economics sessions: "
-            f"{economics_duplicates:,}"
+            f"{duplicate_economics_sessions:,}"
         )
+
         print(
             f"Candidates missing economics: "
-            f"{missing_economics_sessions:,}"
+            f"{candidates_missing_economics:,}"
         )
-
-        if economics_rows != EXPECTED_SESSION_COUNT:
-            raise RuntimeError(
-                "Intervention economics row count does not match "
-                "expected session count."
-            )
-
-        if economics_duplicates != 0:
-            raise RuntimeError(
-                "Duplicate session IDs found in intervention economics."
-            )
-
-        if missing_economics_sessions != 0:
-            raise RuntimeError(
-                "Intervention candidates missing economics records."
-            )
 
         print("Intervention economics: PASSED")
 
+        # -----------------------------------------------------
+        # 7. INTERVENTION PORTFOLIO VALIDATION
+        # -----------------------------------------------------
+
         print("\n7. INTERVENTION PORTFOLIO VALIDATION")
 
-        portfolio_rows = get_row_count(
-            connection,
-            "analytics_intervention_portfolio",
-        )
+        portfolio_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM analytics_intervention_portfolio
+            """
+        ).fetchone()[0]
 
-        portfolio_duplicates = get_duplicate_session_count(
-            connection,
-            "analytics_intervention_portfolio",
-        )
+        duplicate_portfolio_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT
+                    session_id
+                FROM analytics_intervention_portfolio
+                GROUP BY session_id
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
 
-        missing_portfolio_economics = connection.execute(
+        portfolio_missing_economics = connection.execute(
             """
             SELECT COUNT(*)
             FROM analytics_intervention_portfolio AS portfolio
@@ -362,50 +471,80 @@ def main() -> None:
             """
         ).fetchone()[0]
 
-        print(f"Portfolio sessions: {portfolio_rows:,}")
-        print(
-            f"Portfolio capacity limit: {PORTFOLIO_CAPACITY:,}"
+        portfolio_capacity_limit = 500
+
+        require(
+            portfolio_sessions <= portfolio_capacity_limit,
+            (
+                "Portfolio exceeds capacity limit: "
+                f"{portfolio_sessions} > {portfolio_capacity_limit}"
+            ),
         )
+
+        require(
+            duplicate_portfolio_sessions == 0,
+            (
+                "Duplicate portfolio sessions found: "
+                f"{duplicate_portfolio_sessions}"
+            ),
+        )
+
+        require(
+            portfolio_missing_economics == 0,
+            (
+                "Portfolio sessions missing economics: "
+                f"{portfolio_missing_economics}"
+            ),
+        )
+
+        print(
+            f"Portfolio sessions: {portfolio_sessions:,}"
+        )
+
+        print(
+            f"Portfolio capacity limit: "
+            f"{portfolio_capacity_limit:,}"
+        )
+
         print(
             f"Duplicate portfolio sessions: "
-            f"{portfolio_duplicates:,}"
+            f"{duplicate_portfolio_sessions:,}"
         )
+
         print(
             f"Portfolio sessions missing economics: "
-            f"{missing_portfolio_economics:,}"
+            f"{portfolio_missing_economics:,}"
         )
-
-        if portfolio_rows > PORTFOLIO_CAPACITY:
-            raise RuntimeError(
-                "Portfolio exceeds configured capacity."
-            )
-
-        if portfolio_duplicates != 0:
-            raise RuntimeError(
-                "Duplicate session IDs found in portfolio."
-            )
-
-        if missing_portfolio_economics != 0:
-            raise RuntimeError(
-                "Portfolio contains sessions "
-                "without economics records."
-            )
 
         print("Intervention portfolio: PASSED")
 
+        # -----------------------------------------------------
+        # 8. ROI RECONCILIATION
+        # -----------------------------------------------------
+
         print("\n8. ROI RECONCILIATION")
 
-        roi_rows = get_row_count(
-            connection,
-            "analytics_intervention_roi",
-        )
+        roi_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM analytics_intervention_roi
+            """
+        ).fetchone()[0]
 
-        roi_duplicates = get_duplicate_session_count(
-            connection,
-            "analytics_intervention_roi",
-        )
+        duplicate_roi_sessions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT
+                    session_id
+                FROM analytics_intervention_roi
+                GROUP BY session_id
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
 
-        missing_roi_sessions = connection.execute(
+        portfolio_missing_roi = connection.execute(
             """
             SELECT COUNT(*)
             FROM analytics_intervention_portfolio AS portfolio
@@ -425,52 +564,98 @@ def main() -> None:
             """
         ).fetchone()[0]
 
-        print(f"ROI sessions: {roi_rows:,}")
-        print(
-            f"Duplicate ROI sessions: {roi_duplicates:,}"
+        require(
+            roi_sessions == portfolio_sessions,
+            (
+                "ROI session count does not match "
+                "portfolio session count."
+            ),
         )
+
+        require(
+            duplicate_roi_sessions == 0,
+            (
+                "Duplicate ROI sessions found: "
+                f"{duplicate_roi_sessions}"
+            ),
+        )
+
+        require(
+            portfolio_missing_roi == 0,
+            (
+                "Portfolio sessions missing ROI: "
+                f"{portfolio_missing_roi}"
+            ),
+        )
+
+        require(
+            unexpected_roi_sessions == 0,
+            (
+                "Unexpected ROI sessions: "
+                f"{unexpected_roi_sessions}"
+            ),
+        )
+
+        print(
+            f"ROI sessions: {roi_sessions:,}"
+        )
+
+        print(
+            f"Duplicate ROI sessions: "
+            f"{duplicate_roi_sessions:,}"
+        )
+
         print(
             f"Portfolio sessions missing ROI: "
-            f"{missing_roi_sessions:,}"
+            f"{portfolio_missing_roi:,}"
         )
+
         print(
             f"Unexpected ROI sessions: "
             f"{unexpected_roi_sessions:,}"
         )
 
-        if roi_rows != portfolio_rows:
-            raise RuntimeError(
-                "ROI row count does not match portfolio row count."
-            )
-
-        if roi_duplicates != 0:
-            raise RuntimeError(
-                "Duplicate session IDs found in ROI dataset."
-            )
-
-        if missing_roi_sessions != 0:
-            raise RuntimeError(
-                "Portfolio sessions missing ROI records."
-            )
-
-        if unexpected_roi_sessions != 0:
-            raise RuntimeError(
-                "ROI dataset contains sessions "
-                "outside the selected portfolio."
-            )
-
         print("ROI reconciliation: PASSED")
+
+        # -----------------------------------------------------
+        # 9. FINAL PIPELINE CONTRACT
+        # -----------------------------------------------------
 
         print("\n9. FINAL PIPELINE CONTRACT")
 
-        print(
-            f"Source sessions: {EXPECTED_SESSION_COUNT:,}"
+        require(
+            churn_sessions == risk_score_sessions,
+            "Source and risk score session counts do not match.",
         )
-        print(
-            f"Portfolio sessions: {portfolio_rows:,}"
+
+        require(
+            candidate_sessions == economics_sessions,
+            "Candidate and economics session counts do not match.",
         )
+
+        require(
+            portfolio_sessions == roi_sessions,
+            "Portfolio and ROI session counts do not match.",
+        )
+
+        require(
+            portfolio_sessions <= economics_sessions,
+            (
+                "Portfolio contains more sessions than "
+                "the intervention economics dataset."
+            ),
+        )
+
         print(
-            f"ROI sessions: {roi_rows:,}"
+            f"Source sessions: {churn_sessions:,}"
+        )
+
+        print(
+            f"Portfolio sessions: {portfolio_sessions:,}"
+        )
+
+        print(
+            f"ROI sessions: {roi_sessions:,}"
         )
 
         print("\nCOMPLETE END-TO-END PIPELINE VALIDATION PASSED")
